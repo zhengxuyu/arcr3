@@ -171,80 +171,45 @@ You can call it multiple times per turn if you have several discoveries.
 
 ### Game Rules
 
-- Color 11 bar at bottom (row 62) is energy/turn counter: resets each level, decreases by 2 per action
+- Color 11 bar at bottom (row 62) is energy/turn counter: resets each level to ~84 cells, decreases by 2 per action
 - Player is a paired entity: color 9 (3x5 rect) + color 12 (2x5 rect), moving together
+- Color 12 is on top of color 9 (offset ~2 rows up)
 - Movement is 5 cells per action in all directions
 - Navigating player INTO a target structure (bordered box) scores a point and advances to next level
 - Multi-level game: completing a level loads a new grid with new layout, full energy reset
+- Two grids shown after level completion: Grid 0 shows completed state, Grid 1 shows new level
 - Score = number of levels completed
-- Collecting color 11 small objects (8 cells, border pattern) refills energy bar AND are required triggers
-- Must collect ALL triggers before target structure opens (like Level 1 pattern)
 
 ### Level Strategies
-## Level 2 (Score 1→2): IN PROGRESS
-- Player starts at (43,31)
-- Target: color 5 structure (7x7) at (42,16) with color 9 border
-- Trigger 1: color 11 at (17,16) — COLLECTED! Energy refilled 60→84 (+24)
-- Trigger 2: color 11 at (52,31) — NOT YET COLLECTED
-- Mystery object: color 0 border at (47,51) — possible 3rd trigger
-
-### CURRENT POSITION: (18,16) after collecting trigger 1
-### NEXT GOAL: Collect trigger 2 at (52,31)
-- Need to go DOWN through left corridor to ~row 52
-- Then RIGHT to col 31
-- Watch for wall at rows 45-49 blocking cols 23-38
-- Left corridor (cols 9-18) may go all the way down past row 49
-
-### MAZE WALLS:
-- Cols 24-28: wall blocking rows 5-34 (vertical wall in upper area)
-- Rows 45-49: wall blocking cols 23-38 (horizontal wall in middle)
-- Cols 39-43: wall blocking rows 30-44 (right side wall)
-
-### ROUTE PLAN from (18,16):
-1. DOWN x7 to reach row ~53 (through left corridor)
-2. RIGHT x3 to reach col ~31 (collect trigger 2)
-3. Then navigate UP+RIGHT to target at (42,16)
-
-### Energy: 84 cells = ~42 actions, should be enough
 
 ## Level 1 (Score 0→1): COMPLETED
-- Player started around (28,26), target at (12,36)
-- Collected trigger at (32,21) which revealed two structures
-- Navigated to top structure at (12,36) — bordered box with color 0 border, color 5 inner border
-- Moving INTO the structure scored the point
-- Optimal path: 21 actions
 
-## Level 2 (Score 1→2): IN PROGRESS
-- Player starts at (43,31)
-- Target: color 5 structure (7x7) at (42,16) with color 9 border
-- Collectibles/triggers to collect FIRST:
-  - Color 11 at (17,16) — COLLECTED in last attempt, refilled energy 48→84
-  - Color 11 at (52,31) — NOT YET COLLECTED
-  - Color 0 border at (47,51) — NOT YET COLLECTED, role unclear
-- CRITICAL: Player was blocked from entering target at (42,16) after going DOWN from (38,16)
-  - Need to collect remaining triggers before target opens
-- Maze navigation: zigzag UP→LEFT pattern needed to navigate through walls (cols 24-33 have walls)
-  - From start (43,31): go UP+LEFT through maze to reach top open area (rows 5-14)
-  - Then LEFT to col 16, DOWN to collectible at (17,16)
-  - After collecting trigger, go DOWN through corridor to target at (42,16)
-  - For second trigger at (52,31): need to go RIGHT from target area
-- Energy: 42 actions per refill, so be efficient
+- Had to collect trigger item at (32,21), which revealed two structures
+- Then navigate player to the top structure at (12,36) - a bordered box with color 0 border, color 5 inner border
+- Moving INTO the structure scored the point
+
+## Level 2 (Score 1→?): IN PROGRESS
+
+- Player starts at (43,31) on Grid 1
+- Color 5 square (7x7) at (42,16) with color 9 border at (42,16) and point at (43,17) — possible target structure
+- Color 11 objects at (17,16) and (52,31) — possibly triggers/collectibles to collect first
+- Color 0 border at (47,51) — another collectible/trigger
+- Color 1 objects near (47,51) — blue dots
+- Energy full: 84 cells
+- Strategy: First check if there's a trigger to collect (like level 1), then navigate to the target structure
+- The color 5 structure at (42,16) is close — try going LEFT to reach it
 
 ### Object Roles
 
-- Color 9 (player body): 3x5 rect, moves with player
-- Color 12 (player top): 2x5 rect, moves with player, positioned above color 9
-- Color 0 border + color 5 inner border: TARGET structure — enter it to score
-- Color 11 bar at bottom row 62: energy meter (decreases 2 cells per action)
-- Color 11 small objects (8 cells, 3x3 border pattern): TRIGGERS — must collect to open target + refill energy
-- Color 5 rect (7x7): target structure in Level 2
-- Color 8 small rects at (62,56/60/62): score indicators
-- Color 3: green floor/path area (traversable)
-- Color 4: walls (non-traversable)
+- Color 0/1 small objects at (32,21) were a collectible/trigger - collecting them revealed two new structures:
+  - Bottom-left structure: color 0 border (10x10) at center (58,6), with color 5 and color 9 interior - looks like a maze pattern
+  - Top structure: color 0 border (7x7) at center (12,36), with color 5 border (5x5) at (12,36)
+- Color 9 (player) is 3x5 rect, color 12 is 2x5 rect - they move together as player entity
+- Color 11 bar at bottom row 62 = energy (decreases 2 cells per action)
+- Color 5 structures: walls/borders
+- Color 3: green floor/path area
+- Color 8: small markers at bottom-right (rows 62, cols 56/60/62) - possibly score indicators
 
 ### Tips
 
-- Always collect ALL triggers before heading to target structure
-- Maze has zigzag corridors — walls block direct paths, go UP to find openings then LEFT/RIGHT
-- Energy refills on trigger collection — plan route through triggers first
-- Color 11 triggers are 3x3 border patterns (8 cells) — distinct from color 11 energy bar at row 62
+(no data yet)

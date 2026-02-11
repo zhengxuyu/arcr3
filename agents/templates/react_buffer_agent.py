@@ -661,13 +661,29 @@ class ReactBufferAgent(LLM, Agent):
         # Skill file path (cached)
         self._skill_path: Optional[Path] = None
 
+        # Level replay: replay previously successful level action sequences
+        self._level_replays: dict[int, list[str]] = {}
+        self._replay_queue: list[str] = []
+        self._replay_index: int = 0
+
         # Auto-resume: load checkpoint if one exists for this game
         resumed = self._load_checkpoint()
+
+        # Load level replays and set up replay queue for level 0
+        self._level_replays = self._load_level_replays()
+        if 0 in self._level_replays and self._retry_count == 0:
+            self._replay_queue = list(self._level_replays[0])
+            self._replay_index = 0
+            logger.info(
+                "Replay loaded for level 0: %d actions",
+                len(self._replay_queue),
+            )
 
         logger.info(
             f"ReactBufferAgent initialized: max_retries={self.MAX_RETRIES}, "
             f"buffer_capacity={self.BUFFER_CAPACITY}, beta={self.RESIDUAL_BETA}"
             f"{', RESUMED from checkpoint' if resumed else ''}"
+            f", replays={list(self._level_replays.keys())}"
         )
 
     # --------------------------------------------------------------------- #
@@ -675,16 +691,35 @@ class ReactBufferAgent(LLM, Agent):
     # --------------------------------------------------------------------- #
 
     def is_done(self, frames: list[FrameData], latest_frame: FrameData) -> bool:
-        """Override to implement retry-on-failure logic.
+        """Override to implement retry-on-failure and multi-level logic.
 
-        On GAME_OVER with retries remaining the agent stores the failed
-        episode, clears its conversation, and will issue RESET on the next
-        ``choose_action`` call.
+        On WIN: if more levels remain, store the successful episode and
+        prepare for the next level (return False to keep playing).
+        On GAME_OVER with retries remaining: store failed episode, reset,
+        and retry.
         """
         if latest_frame.state == GameState.WIN:
             self._store_current_episode(frames, success=True)
+            win_levels = getattr(latest_frame, "win_levels", None)
+            levels_done = latest_frame.levels_completed
+
+            # Save replay for the just-completed level
+            level_actions = [s.action for s in self._current_steps]
+            self._save_level_replay(levels_done - 1, level_actions)
+
+            # Multi-level: continue if more levels remain
+            if win_levels and levels_done < win_levels:
+                logger.info(
+                    f"LEVEL {levels_done}/{win_levels} completed! "
+                    f"Continuing to next level. "
+                    f"Buffer: {self.episode_buffer.get_size()} episodes"
+                )
+                self._prepare_next_level()
+                return False
+
             logger.info(
-                f"WIN after {self._retry_count} retries. "
+                f"WIN (all {levels_done} levels) after "
+                f"{self._retry_count} retries. "
                 f"Buffer: {self.episode_buffer.get_size()} episodes, "
                 f"success rate {self.episode_buffer.get_success_rate():.0%}"
             )
@@ -715,6 +750,9 @@ class ReactBufferAgent(LLM, Agent):
         # Reset loop detector
         self._loop_detector.reset()
         self._loop_detection = None
+        # Reset replay state — retries don't replay
+        self._replay_queue = []
+        self._replay_index = 0
         # Reset perception state but keep learned action effects
         saved_effects = dict(self.perception._action_effects)
         self.perception.reset()
@@ -728,6 +766,59 @@ class ReactBufferAgent(LLM, Agent):
         self._skills_system_prompt = None
         # Clear conversation so choose_action will issue RESET
         self.messages = []
+
+    def _prepare_next_level(self) -> None:
+        """Prepare state for the next level after a level WIN.
+
+        Unlike _prepare_retry, this preserves conversation context (the LLM
+        keeps its learned knowledge) and does NOT issue RESET (the engine
+        auto-transitions to the next level).  Retry count is also preserved.
+
+        If a replay exists for the next level, sets up the replay queue
+        and clears messages (LLM won't be called during replay).
+        """
+        # Determine the next level number from how many steps we just completed
+        # levels_completed was already incremented by the engine
+        next_level = len(self.episode_buffer.episodes)  # rough proxy
+        # Better: count successful episodes for this game
+        successful_levels = sum(
+            1 for ep in self.episode_buffer.episodes
+            if ep.game_id == self.game_id and ep.success
+        )
+
+        self._current_steps = []
+        self._current_step_embeddings = []
+        # Reset loop detector for the new level
+        self._loop_detector.reset()
+        self._loop_detection = None
+        # Reset perception — new level has a new grid layout
+        saved_effects = dict(self.perception._action_effects)
+        self.perception.reset()
+        self.perception._action_effects = saved_effects
+        # Reset VLM caches for fresh entity identification
+        self._cached_entity_text = ""
+        self._entity_step = -1
+        self._prev_bbox_image = None
+        self._cached_change_text = ""
+        # Invalidate skill cache so updated knowledge is re-read
+        self._skills_system_prompt = None
+
+        # Check if we have a replay for the next level
+        if successful_levels in self._level_replays:
+            self._replay_queue = list(
+                self._level_replays[successful_levels]
+            )
+            self._replay_index = 0
+            # Clear messages — not needed during replay
+            self.messages = []
+            logger.info(
+                "Replay loaded for level %d: %d actions",
+                successful_levels, len(self._replay_queue),
+            )
+        else:
+            # No replay — keep messages for LLM context
+            # Do NOT set _needs_reset — engine auto-transitions
+            pass
 
     def _store_current_episode(
         self, frames: list[FrameData], success: bool
@@ -928,6 +1019,46 @@ class ReactBufferAgent(LLM, Agent):
             return False
 
     # --------------------------------------------------------------------- #
+    # Level replay save / load
+    # --------------------------------------------------------------------- #
+
+    def _replays_path(self) -> Path:
+        """Return the replays file path for the current game."""
+        return self._checkpoint_dir() / f"{self.game_id}.replays.json"
+
+    def _save_level_replay(self, level_num: int, actions: list[str]) -> None:
+        """Persist a successful level's action sequence for future replay."""
+        try:
+            # Load existing replays
+            replays = self._load_level_replays()
+            # Only save if we don't already have a replay, or this one is shorter
+            if level_num not in replays or len(actions) < len(replays[level_num]):
+                replays[level_num] = actions
+                path = self._replays_path()
+                # JSON keys must be strings
+                data = {str(k): v for k, v in replays.items()}
+                path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                self._level_replays = replays
+                logger.info(
+                    "Saved replay for level %d: %d actions -> %s",
+                    level_num, len(actions), path.name,
+                )
+        except Exception as e:
+            logger.warning("Failed to save level replay: %s", e)
+
+    def _load_level_replays(self) -> dict[int, list[str]]:
+        """Load level replays from disk."""
+        path = self._replays_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return {int(k): v for k, v in data.items()}
+        except Exception as e:
+            logger.warning("Failed to load level replays: %s", e)
+            return {}
+
+    # --------------------------------------------------------------------- #
     # Skills & system prompt (only grid_perception + arc_game_playing)
     # --------------------------------------------------------------------- #
 
@@ -1030,6 +1161,37 @@ class ReactBufferAgent(LLM, Agent):
         logging.getLogger("openai").setLevel(logging.CRITICAL)
         logging.getLogger("httpx").setLevel(logging.CRITICAL)
 
+        prev_frame = frames[-2] if len(frames) > 1 else frames[-1]
+
+        # --- Phase 0: Level replay (skip LLM calls entirely) ---
+        if self._replay_queue and self._replay_index < len(self._replay_queue):
+            action_name = self._replay_queue[self._replay_index]
+            self._replay_index += 1
+            action = GameAction.from_name(action_name)
+
+            self._record_step(action, prev_frame, latest_frame)
+            self._last_action_name = action.name
+
+            logger.info(
+                "REPLAY step %d/%d: %s (level %d)",
+                self._replay_index,
+                len(self._replay_queue),
+                action_name,
+                latest_frame.levels_completed,
+            )
+            return action
+
+        # Replay queue exhausted — clear it and switch to LLM mode
+        if self._replay_queue:
+            logger.info(
+                "Replay exhausted (%d actions) — switching to LLM mode",
+                len(self._replay_queue),
+            )
+            self._replay_queue = []
+            self._replay_index = 0
+            # Start LLM mode with fresh conversation
+            self.messages = []
+
         api_key = os.environ.get("OPENAI_API_KEY", "")
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
         client = OpenAIClient(
@@ -1042,8 +1204,6 @@ class ReactBufferAgent(LLM, Agent):
 
         if self._needs_reset:
             self._needs_reset = False
-
-        prev_frame = frames[-2] if len(frames) > 1 else frames[-1]
 
         # --- Phase 1: RESET on first call / after retry ---
         if len(self.messages) == 0:
@@ -1179,27 +1339,36 @@ class ReactBufferAgent(LLM, Agent):
                     "content": "Error: only one tool call at a time.",
                 })
 
-            if (
-                tool_call.function.name == "update_game_notes"
-                and notes_calls < self.MAX_NOTES_PER_TURN
-            ):
-                # Process game notes update, then loop for game action
-                notes_calls += 1
-                result = self._handle_game_notes_update(
-                    tool_call.function.arguments
-                )
-                self.push_message({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": result,
-                })
-                logger.info(
-                    "update_game_notes call %d/%d: %s",
-                    notes_calls, self.MAX_NOTES_PER_TURN, result,
-                )
+            if tool_call.function.name == "update_game_notes":
+                if notes_calls < self.MAX_NOTES_PER_TURN:
+                    # Process game notes update, then loop for game action
+                    notes_calls += 1
+                    result = self._handle_game_notes_update(
+                        tool_call.function.arguments
+                    )
+                    self.push_message({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": result,
+                    })
+                    logger.info(
+                        "update_game_notes call %d/%d: %s",
+                        notes_calls, self.MAX_NOTES_PER_TURN, result,
+                    )
+                else:
+                    # Over quota — tell LLM to pick a game action instead
+                    self.push_message({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": (
+                            f"Error: max {self.MAX_NOTES_PER_TURN} "
+                            "update_game_notes calls per turn. "
+                            "Now call a game action."
+                        ),
+                    })
                 continue
             else:
-                # Game action (or max notes calls reached)
+                # Game action
                 name = tool_call.function.name
                 arguments = tool_call.function.arguments
                 logger.debug(
