@@ -1,0 +1,40 @@
+# OS and environment
+.DS_Store
+*.log
+*.env
+!.env-example
+
+# Cache
+.ruff_cache/
+.mypy_cache/
+**/__pycache__/
+
+# IDE settings
+.vscode/
+
+# Claude Code local config
+.claude/
+
+# Python virtual environment
+.venv/
+
+# Lock file (runtime-generated)
+uv.lock
+
+# Recordings
+recordings/*.recording.jsonl
+tests/recordings/*.recording.jsonl
+tests/recordings/not-a-recording.txt
+
+# Long-term memory
+memory.db
+
+# Runtime / generated files
+environment_files/
+*.mp4
+*.gif
+perception_test_results/
+checkpoints/
+
+# Runtime skill copy (agent writes here during play)
+/arc_game_playing/
