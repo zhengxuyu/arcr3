@@ -3,7 +3,7 @@ name: arc_game_playing
 description: "Core strategy and reasoning framework for playing ARC-AGI-3 grid-based games. Covers the game loop (observe → hypothesize → act → learn), action semantics, common game patterns, exploration vs exploitation, and how to recover from failures. Apply at every step."
 ---
 
-# ARC-AGI-3 游戏攻略 (Game Playing Strategy)
+# ARC-AGI-3 Game Playing Strategy
 
 You are playing an **unknown** dynamic grid-based game. The rules, objectives, and mechanics are NOT told to you — you must **discover** them through observation and experimentation.
 
@@ -24,6 +24,8 @@ Every step, follow this cycle:
 - What objects exist? Where is the player? What changed since last frame?
 - Did the last action have an effect, or was it a no-op (wall hit)?
 - Is the score the same, higher, or did state change?
+- Check INTERACTION RULES for learned cause-and-effect patterns.
+- Check OBJECT INVENTORY for targets and their distances.
 
 ### 2. Hypothesize (form or update your mental model)
 
@@ -41,6 +43,7 @@ Every step, follow this cycle:
 - Never act randomly. State your reason: "I move RIGHT because the exit is to the right."
 - If unsure, choose the action that gives the **most information** (exploration).
 - Avoid repeating an action that just produced no effect.
+- **Use navigate_to(row, col) for efficient pathfinding** when you know where to go.
 
 ### 4. Learn (update your understanding)
 
@@ -65,6 +68,26 @@ Common mappings (but verify!):
 
 - ACTION1=Up, ACTION2=Down, ACTION3=Left, ACTION4=Right, ACTION5=Confirm/Space
 - Some games swap Up/Down or use different schemes. **Always verify.**
+
+## Using navigate_to
+
+You have a tool called `navigate_to(row, col)` that uses BFS pathfinding to compute
+the shortest path to any grid position, avoiding known walls automatically.
+
+**When to use navigate_to:**
+- Going to a specific object you see in the OBJECT INVENTORY
+- Returning to a previously visited location
+- Reaching the goal after collecting all prerequisites
+- Any time you know WHERE you want to go but not the exact action sequence
+
+**How it works:**
+1. You call `navigate_to(row, col)` with the target position
+2. The system computes a BFS path on the step-quantized grid (5 cells/step)
+3. Known walls are avoided; unknown cells are treated as walkable (optimistic)
+4. The path executes automatically, stopping on wall hit or score change
+5. After execution, you receive a new observation
+
+**Prefer navigate_to over execute_plan** for reaching objects — it handles wall avoidance for you.
 
 ## Common Game Patterns
 
@@ -92,6 +115,43 @@ Common mappings (but verify!):
 - **Goal**: Complete all levels (score tracks current level).
 - **Pattern**: Score jumps = level cleared. Grid resets with new layout.
 - **Strategy**: What worked in level 1 may not work in level 2. Re-discover rules each level.
+
+## Interactive Object Discovery
+
+When you see small clusters of colored cells that are **distinct from walls and floor**:
+
+1. **They are likely interactive.** Move your player directly onto them to test.
+2. **If an object disappears when you overlap it**, you collected/activated it. Record this interaction pattern.
+3. **If a resource bar changes** (refills, depletes) after interacting, that object type affects your resources. Note which objects are beneficial.
+4. **Scan the ENTIRE grid** for all objects of the same type before heading to the goal — there may be multiple.
+
+## Prerequisite Detection
+
+Many games require you to complete prerequisites before reaching the goal:
+
+1. **If you reach a goal/target and CANNOT enter**, this means there are prerequisites you haven't fulfilled.
+2. **Common prerequisites**: collect all items of a certain type, activate all switches, clear all enemies.
+3. **Test**: After being blocked at the goal, search the grid for any remaining interactive objects you haven't visited.
+4. **Rule of thumb**: If object type X disappears when you touch it, assume ALL instances of type X must be collected before the goal opens.
+
+## Cross-Level Learning
+
+In multi-level games, the same game mechanics usually persist across levels:
+
+1. **If collecting object type X was required in Level 1, it will likely be required in Level 2.**
+2. **On entering a new level**: immediately scan for the same types of interactive objects you discovered before.
+3. **Apply the same strategy**: collect all prerequisites first, then head to the goal.
+4. **Adapt to new layouts**: The positions change but the mechanics stay the same.
+5. **Use update_game_notes** to record confirmed mechanics — this knowledge persists across levels and retries.
+
+## Resource Management
+
+If the game has a resource bar (energy, health, time):
+
+1. **Track the depletion rate** — how much resource each action costs.
+2. **Identify refill sources** — which objects restore the resource when collected.
+3. **Plan routes through refill sources** to extend your effective range.
+4. **If you run out of resource and get GAME_OVER**, prioritize visiting refill sources earlier on the next attempt.
 
 ## Exploration vs Exploitation
 
@@ -129,6 +189,7 @@ On retry:
 3. **Plan before acting**: Think 3-5 steps ahead based on the grid layout.
 4. **Score is progress**: If score hasn't changed in 10+ actions, reassess your strategy.
 5. **Fast fail**: If a hypothesis is wrong, abandon it quickly and try something new.
+6. **Use navigate_to**: When you know a target position, use pathfinding instead of manual navigation.
 
 ## Reasoning Template
 
@@ -137,9 +198,10 @@ Use this structure for your observation each step:
 ```
 1. What happened: [describe the effect of the last action]
 2. Current state: [player position, score, nearby objects]
-3. Hypothesis: [what I think the game wants me to do]
-4. Plan: [next 2-3 actions and why]
-5. Next action: [specific action and reasoning]
+3. Inventory check: [what does the OBJECT INVENTORY say? any suggested targets?]
+4. Hypothesis: [what I think the game wants me to do]
+5. Plan: [next 2-3 actions and why]
+6. Next action: [specific action/navigate_to call and reasoning]
 ```
 
 ## Using update_game_notes
@@ -182,34 +244,24 @@ You can call it multiple times per turn if you have several discoveries.
 
 ### Level Strategies
 
-## Level 1 (Score 0→1): COMPLETED
-
-- Had to collect trigger item at (32,21), which revealed two structures
-- Then navigate player to the top structure at (12,36) - a bordered box with color 0 border, color 5 inner border
-- Moving INTO the structure scored the point
-
-## Level 2 (Score 1→?): IN PROGRESS
-
-- Player starts at (43,31) on Grid 1
-- Color 5 square (7x7) at (42,16) with color 9 border at (42,16) and point at (43,17) — possible target structure
-- Color 11 objects at (17,16) and (52,31) — possibly triggers/collectibles to collect first
-- Color 0 border at (47,51) — another collectible/trigger
-- Color 1 objects near (47,51) — blue dots
-- Energy full: 84 cells
-- Strategy: First check if there's a trigger to collect (like level 1), then navigate to the target structure
-- The color 5 structure at (42,16) is close — try going LEFT to reach it
+- Level 1: Collect trigger item first, then navigate to the target structure (bordered box)
+- Pattern: collect prerequisites -> navigate to goal
+- Same pattern expected in subsequent levels
 
 ### Object Roles
 
-- Color 0/1 small objects at (32,21) were a collectible/trigger - collecting them revealed two new structures:
-  - Bottom-left structure: color 0 border (10x10) at center (58,6), with color 5 and color 9 interior - looks like a maze pattern
-  - Top structure: color 0 border (7x7) at center (12,36), with color 5 border (5x5) at (12,36)
-- Color 9 (player) is 3x5 rect, color 12 is 2x5 rect - they move together as player entity
-- Color 11 bar at bottom row 62 = energy (decreases 2 cells per action)
-- Color 5 structures: walls/borders
-- Color 3: green floor/path area
-- Color 8: small markers at bottom-right (rows 62, cols 56/60/62) - possibly score indicators
+- Color 9 + color 12 = player entity (move together)
+- Color 11 bar at bottom row 62 = energy (decreases 2 cells per action, resets on level completion)
+- Color 5 structures = walls/borders
+- Color 3 = green floor/path area
+- Color 8 small markers at bottom-right = score indicators
+- Small colored objects (color 0/1 clusters) = collectible triggers
+- Bordered boxes (color 0 border + color 5 inner) = goal/target structures
 
 ### Tips
 
-(no data yet)
+- Always collect ALL trigger/prerequisite objects before heading to the goal
+- Use navigate_to(row, col) for efficient pathfinding to known object positions
+- Check OBJECT INVENTORY for suggested next targets and distances
+- Check INTERACTION RULES for learned cause-and-effect patterns
+- Energy refill objects (if any) should be prioritized when energy is low

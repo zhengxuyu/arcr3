@@ -1,22 +1,14 @@
 """
-React Agent with Exploration Buffer and Residual-Guided Decoding for ARC-AGI-3.
-
-Adapted from R2 (Residual-Guided Decoding with Test-Time In-Context Learning).
+React Agent with Exploration Buffer for ARC-AGI-3.
 
 Core ideas:
 1. **Exploration Buffer**: Stores past game episodes (state-action trajectories)
    with embeddings for similarity retrieval.
-2. **Residual Function**: Scores candidate actions by aggregating over buffer
-   entries with cosine similarity (TRL Eq. 15-16).
-3. **Temporal Credit Assignment**: Success credits later steps more, failure
-   blames earlier steps more (TRL Eq. 22).
-4. **Dual Buffer Pattern**: Long-term buffer (B_train) across retries +
-   working memory (B_infer) per attempt.
-5. **ReAct Loop**: Observe -> Retrieve from buffer -> Reason -> Act -> Learn.
+2. **ReAct Loop**: Observe -> Retrieve from buffer -> Reason -> Act -> Learn.
 
 On GAME_OVER the agent does NOT exit. Instead it stores the failed trajectory,
 resets the game, and retries with accumulated experience informing the LLM
-via buffer-augmented prompts and residual-guided action hints.
+via buffer-augmented prompts.
 
 Tools available to the LLM:
 - Game actions: RESET, ACTION1-ACTION6
@@ -34,6 +26,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import textwrap
 import time
 from dataclasses import asdict, dataclass, field
@@ -47,6 +41,14 @@ from openai import OpenAI as OpenAIClient
 
 from ..agent import Agent
 from ..skills_loader import format_skills_for_prompt, load_local_skills
+from .game_intelligence import (
+    GridNavigator,
+    InteractionEventType,
+    InteractionTracker,
+    ObjectInventory,
+    ObjectStatus,
+    TransformationDetector,
+)
 from .grid_perception import GridPerception, ObjectAnnotator
 from .llm_agents import LLM
 
@@ -122,6 +124,53 @@ def compute_frame_diff(prev_frame: FrameData, curr_frame: FrameData) -> str:
                 diffs.append(f"g{g_idx}:D{changed}cells")
 
     return "|".join(diffs) if diffs else "no_change"
+
+
+def _parse_cells_changed(diff_text: str) -> int:
+    """Extract total cells changed from frame diff like 'g0:D42cells'."""
+    total = 0
+    for m in re.finditer(r'D(\d+)cells', diff_text):
+        total += int(m.group(1))
+    return total
+
+
+# Threshold: energy bar changes 1-3 cells, player movement changes 25+ cells
+MIN_CELLS_FOR_MOVEMENT = 8
+
+
+def _did_player_move(
+    prev_grid: list[list[int]],
+    curr_grid: list[list[int]],
+    player_colors: set[int],
+) -> bool:
+    """Check if player-colored cells shifted between frames.
+
+    Uses a bounded region around the last known player position
+    to avoid confusion from same-colored cells elsewhere in the grid
+    (score indicators, decorations, etc.).
+    """
+    if not player_colors:
+        return False
+
+    # Count cells of player colors that CHANGED between frames.
+    # If the player moved, many cells will differ (new position ≠ old).
+    # If the player didn't move, very few cells of player colors will differ.
+    changed = 0
+    for r in range(len(prev_grid)):
+        for c in range(len(prev_grid[0])):
+            pv = prev_grid[r][c]
+            cv = curr_grid[r][c]
+            if pv != cv and (pv in player_colors or cv in player_colors):
+                changed += 1
+
+    # Player body is ~15 cells (3x5), head is ~10 cells (2x5).
+    # When the player moves, ~25 player-colored cells change.
+    # When the player doesn't move, 0 player-colored cells change.
+    # Threshold at 5 to distinguish.
+    moved = changed >= 5
+    logger.debug("_did_player_move: colors=%s changed=%d moved=%s",
+                 player_colors, changed, moved)
+    return moved
 
 
 # =============================================================================
@@ -335,106 +384,6 @@ class EpisodeBuffer:
 
 
 # =============================================================================
-# Residual Function  (TRL Eq. 15-16, 20, 22)
-# =============================================================================
-
-
-class ResidualFunction:
-    """Score state-action pairs using buffer entries with temporal credit.
-
-    Implements the multi-step residual from
-    ``r2/src/alfworld/residual.py::ALFWorldResidualFunction`` adapted for
-    the ARC-AGI-3 discrete-action domain:
-
-        R_kappa(s_t, a; B) = sum_i  w_i * sum_{t'} phi(e(s_t,a), e_i,t') * c(tau_i, t')
-
-    where:
-        w_i   = exp(beta * R(tau_i)) / Z                          (Eq. 16)
-        phi   = cosine_similarity                                  (Eq. 20)
-        c     = R(tau_i) * omega(t'; T)                            (Eq. 22)
-        omega = t'/T  for success,  1-t'/T  for failure
-    """
-
-    def __init__(self, beta: float = 1.0):
-        self.beta = beta
-
-    @staticmethod
-    def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-        na, nb = np.linalg.norm(a), np.linalg.norm(b)
-        if na == 0 or nb == 0:
-            return 0.0
-        return float(np.dot(a, b) / (na * nb))
-
-    def _compute_weights(self, rewards: list[float]) -> np.ndarray:
-        """Softmax weights by reward (Eq. 16)."""
-        logits = np.array([self.beta * r for r in rewards], dtype=np.float64)
-        logits -= logits.max()
-        w = np.exp(logits)
-        total = w.sum()
-        if total > 0:
-            w /= total
-        return w
-
-    @staticmethod
-    def _temporal_credit(reward: float, step_idx: int, total_steps: int) -> float:
-        """Per-step credit c(tau, t') with temporal weighting (Eq. 22).
-
-        Success: later steps credited more  (omega = t'/T).
-        Failure: earlier steps blamed more  (omega = 1 - t'/T).
-        """
-        if total_steps <= 0:
-            return 0.0
-        t = (step_idx + 1) / total_steps
-        omega = t if reward > 0 else (1.0 - t)
-        return reward * omega
-
-    def score_action(
-        self,
-        sa_emb: np.ndarray,
-        buffer: EpisodeBuffer,
-        query_emb: np.ndarray,
-        k: int = 5,
-    ) -> float:
-        """Compute R_kappa(s_t, a; B) for a single state-action embedding.
-
-        Args:
-            sa_emb: State-action embedding ``e(s_t, a)``.
-            buffer: Episode buffer to retrieve from.
-            query_emb: Episode-level query for retrieval.
-            k: Number of entries to retrieve.
-
-        Returns:
-            Scalar residual score.
-        """
-        entries = buffer.retrieve(query_emb, k=k)
-        if not entries:
-            return 0.0
-
-        rewards = [
-            (1.0 if ep.success else -0.5) for ep, _ in entries
-        ]
-        weights = self._compute_weights(rewards)
-
-        residual = 0.0
-        for idx, (ep, task_sim) in enumerate(entries):
-            if ep.step_embeddings:
-                T = len(ep.step_embeddings)
-                step_score = 0.0
-                for s_idx, step_emb in enumerate(ep.step_embeddings):
-                    sim = self._cosine_sim(sa_emb, step_emb)
-                    credit = self._temporal_credit(
-                        1.0 if ep.success else -0.5, s_idx, T
-                    )
-                    step_score += sim * credit
-                residual += weights[idx] * step_score
-            else:
-                credit = 1.0 if ep.success else -0.5
-                residual += weights[idx] * task_sim * credit
-
-        return residual
-
-
-# =============================================================================
 # Loop Detection
 # =============================================================================
 
@@ -575,7 +524,7 @@ class LoopDetector:
 
 
 class ReactBufferAgent(LLM, Agent):
-    """React Agent with Exploration Buffer and Residual-Guided Decoding.
+    """React Agent with Exploration Buffer.
 
     Explores ARC-AGI-3 games by:
     1. Playing normally until WIN or GAME_OVER.
@@ -583,8 +532,6 @@ class ReactBufferAgent(LLM, Agent):
        ``MAX_RETRIES`` times) instead of exiting.
     3. Injecting buffer-retrieved past experiences into the LLM prompt so
        the model can learn from prior failures/successes.
-    4. Computing residual action-hints that quantify which actions are
-       more similar to past successful steps vs. failed ones.
 
     Tools:
     - Game actions: RESET, ACTION1-ACTION6
@@ -598,15 +545,21 @@ class ReactBufferAgent(LLM, Agent):
     MAX_ACTIONS: int = 300
     MAX_RETRIES: int = 5
     DO_OBSERVATION: bool = True
+    # Inline VLM mode: "periodic" (default), "always", or "off"
+    #   periodic: image in first INLINE_VLM_WARMUP steps, then every INLINE_VLM_INTERVAL steps
+    #   always:   image every step
+    #   off:      no image (pure text perception)
+    INLINE_VLM: str = "periodic"
+    INLINE_VLM_WARMUP: int = 10   # first N steps always include image
+    INLINE_VLM_INTERVAL: int = 8  # after warmup, include image every N steps
     MODEL: str = "o4-mini"
     REASONING_EFFORT: Optional[str] = "medium"
     MODEL_REQUIRES_TOOLS: bool = True
     MESSAGE_LIMIT: int = 20
 
-    # Buffer / residual configuration
+    # Buffer configuration
     BUFFER_CAPACITY: int = 100
     NUM_RETRIEVE: int = 3
-    RESIDUAL_BETA: float = 1.0
     EMB_DIM: int = 512
 
     # Only inject these two skills into the system prompt
@@ -623,24 +576,49 @@ class ReactBufferAgent(LLM, Agent):
     CHECKPOINT_INTERVAL: int = 5
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Timestamp must be set BEFORE super().__init__ because
+        # start_recording() reads self.name which includes the timestamp.
+        from datetime import datetime
+        self._start_time_tag = datetime.now().strftime("%m%d_%H%M")
+
         super().__init__(*args, **kwargs)
 
         self._embedder = SimpleEmbedding(dim=self.EMB_DIM)
         self.episode_buffer = EpisodeBuffer(
             capacity=self.BUFFER_CAPACITY, emb_dim=self.EMB_DIM
         )
-        self.residual_fn = ResidualFunction(beta=self.RESIDUAL_BETA)
+
+        # Inline VLM: env override (periodic|always|off, or legacy 0/1)
+        _vlm_env = os.environ.get("INLINE_VLM", "").strip().lower()
+        if _vlm_env in ("0", "false", "no", "off"):
+            self.INLINE_VLM = "off"
+        elif _vlm_env in ("1", "true", "yes", "always"):
+            self.INLINE_VLM = "always"
+        elif _vlm_env == "periodic":
+            self.INLINE_VLM = "periodic"
+
+        # Store current bbox image for inline VLM mode (Phase 4 multimodal message)
+        self._current_bbox_image = None
+        self._step_count_for_vlm = 0  # tracks steps within current level for periodic mode
 
         # Grid perception engine (replaces raw grid dump with structured analysis)
         self.perception = GridPerception()
 
         # VLM object annotator — identifies objects + detects changes
-        self._annotator = ObjectAnnotator(model=self._model)
+        # Uses VLM_MODEL env var if set, otherwise falls back to main model
+        vlm_model = os.environ.get("VLM_MODEL", "") or self._model
+        self._annotator = ObjectAnnotator(model=vlm_model)
         self._cached_entity_text: str = ""  # latest entity identification text
         self._entity_step: int = -1         # step when last identified entities
         self.ENTITY_INTERVAL: int = 8       # re-identify entities every N steps
         self._prev_bbox_image = None        # previous frame's bbox image for diff
         self._cached_change_text: str = ""  # latest change detection text
+
+        # Game intelligence modules
+        self._navigator = GridNavigator()
+        self._interaction_tracker = InteractionTracker()
+        self._inventory = ObjectInventory()
+        self._transformation_detector = TransformationDetector()
 
         # Current-episode tracking
         self._current_steps: list[StepRecord] = []
@@ -666,12 +644,57 @@ class ReactBufferAgent(LLM, Agent):
         self._replay_queue: list[str] = []
         self._replay_index: int = 0
 
+        # Action plan queue (from execute_plan tool)
+        self._action_plan: list[str] = []
+
+        # Estimated player position during plan execution (updated after each
+        # successful step using the action's direction delta).
+        self._plan_estimated_pos: Optional[tuple[int, int]] = None
+        self._last_detected_pos: Optional[tuple[int, int]] = None
+
+        # Deferred navigator update: (player_pos_before, action_name)
+        # Resolved at the START of the next choose_action when the result frame is available
+        self._pending_nav_update: Optional[tuple[tuple[int, int], str]] = None
+
+        # Reset skill file from template before each run
+        self._reset_skill_from_template()
+
         # Auto-resume: load checkpoint if one exists for this game
         resumed = self._load_checkpoint()
 
+        # Parse SKIP_REPLAY env var (comma-separated, controls which replays to skip)
+        # Formats:  "0,1"         — skip levels 0,1 for ALL games
+        #           "ls20:0"      — skip level 0 only for game ls20 (matches game_id prefix)
+        #           "ls20:0,1"    — skip levels 0 and 1 for ls20, all other games unaffected
+        skip_str = os.environ.get("SKIP_REPLAY", "").strip()
+        # Global level skips (no game prefix)
+        self._skip_replay_global: set[int] = set()
+        # Per-game level skips: game_prefix -> set of levels
+        self._skip_replay_game: dict[str, set[int]] = {}
+        if skip_str:
+            for entry in skip_str.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                if ":" in entry:
+                    game_part, level_part = entry.split(":", 1)
+                    game_part = game_part.strip()
+                    for lv in level_part.split(","):
+                        lv = lv.strip()
+                        if lv.isdigit():
+                            self._skip_replay_game.setdefault(game_part, set()).add(int(lv))
+                elif entry.isdigit():
+                    self._skip_replay_global.add(int(entry))
+            if self._skip_replay_global or self._skip_replay_game:
+                logger.info(
+                    "Replay skip config: global=%s, per-game=%s",
+                    self._skip_replay_global or "none",
+                    {k: v for k, v in self._skip_replay_game.items()} or "none",
+                )
+
         # Load level replays and set up replay queue for level 0
         self._level_replays = self._load_level_replays()
-        if 0 in self._level_replays and self._retry_count == 0:
+        if 0 in self._level_replays and self._retry_count == 0 and not self._should_skip_replay(0):
             self._replay_queue = list(self._level_replays[0])
             self._replay_index = 0
             logger.info(
@@ -681,7 +704,8 @@ class ReactBufferAgent(LLM, Agent):
 
         logger.info(
             f"ReactBufferAgent initialized: max_retries={self.MAX_RETRIES}, "
-            f"buffer_capacity={self.BUFFER_CAPACITY}, beta={self.RESIDUAL_BETA}"
+            f"buffer_capacity={self.BUFFER_CAPACITY}"
+            f", inline_vlm={self.INLINE_VLM}"
             f"{', RESUMED from checkpoint' if resumed else ''}"
             f", replays={list(self._level_replays.keys())}"
         )
@@ -707,6 +731,9 @@ class ReactBufferAgent(LLM, Agent):
             level_actions = [s.action for s in self._current_steps]
             self._save_level_replay(levels_done - 1, level_actions)
 
+            # Auto-generate video snapshot
+            self._generate_video(f"L{levels_done}_complete")
+
             # Multi-level: continue if more levels remain
             if win_levels and levels_done < win_levels:
                 logger.info(
@@ -723,6 +750,7 @@ class ReactBufferAgent(LLM, Agent):
                 f"Buffer: {self.episode_buffer.get_size()} episodes, "
                 f"success rate {self.episode_buffer.get_success_rate():.0%}"
             )
+            self._generate_video(f"L{levels_done}_complete")
             return True
 
         if latest_frame.state == GameState.GAME_OVER:
@@ -750,18 +778,28 @@ class ReactBufferAgent(LLM, Agent):
         # Reset loop detector
         self._loop_detector.reset()
         self._loop_detection = None
-        # Reset replay state — retries don't replay
+        # Reset game intelligence modules (keep rules/classifications)
+        self._navigator.reset()
+        self._interaction_tracker.reset()
+        self._inventory.reset(keep_classifications=True)
+        self._transformation_detector.reset()
+        # Reset replay and plan state — retries don't replay
         self._replay_queue = []
         self._replay_index = 0
+        self._action_plan = []
+        self._plan_estimated_pos = None
+        self._pending_nav_update = None
         # Reset perception state but keep learned action effects
         saved_effects = dict(self.perception._action_effects)
         self.perception.reset()
         self.perception._action_effects = saved_effects
-        # Reset VLM annotation caches for fresh start on retry
+        # Reset VLM annotation caches and periodic counter for fresh start on retry
+        self._step_count_for_vlm = 0
         self._cached_entity_text = ""
         self._entity_step = -1
         self._prev_bbox_image = None
         self._cached_change_text = ""
+        self._current_bbox_image = None
         # Invalidate skill cache so updated knowledge is re-read
         self._skills_system_prompt = None
         # Clear conversation so choose_action will issue RESET
@@ -786,25 +824,41 @@ class ReactBufferAgent(LLM, Agent):
             if ep.game_id == self.game_id and ep.success
         )
 
+        # Auto-generate level summary BEFORE resetting modules
+        # (need their accumulated knowledge for the summary)
+        self._generate_level_summary(level_num=successful_levels)
+
         self._current_steps = []
         self._current_step_embeddings = []
         # Reset loop detector for the new level
         self._loop_detector.reset()
         self._loop_detection = None
+        # Reset game intelligence modules (keep rules/classifications for cross-level learning)
+        self._navigator.reset()
+        self._interaction_tracker.reset()
+        self._inventory.reset(keep_classifications=True)
+        self._transformation_detector.reset()
         # Reset perception — new level has a new grid layout
         saved_effects = dict(self.perception._action_effects)
         self.perception.reset()
         self.perception._action_effects = saved_effects
-        # Reset VLM caches for fresh entity identification
+        # Reset VLM caches and periodic counter for fresh entity identification
+        self._step_count_for_vlm = 0
         self._cached_entity_text = ""
         self._entity_step = -1
         self._prev_bbox_image = None
         self._cached_change_text = ""
+        self._current_bbox_image = None
         # Invalidate skill cache so updated knowledge is re-read
         self._skills_system_prompt = None
 
+        # Reset action plan and deferred navigator update
+        self._action_plan = []
+        self._plan_estimated_pos = None
+        self._pending_nav_update = None
+
         # Check if we have a replay for the next level
-        if successful_levels in self._level_replays:
+        if successful_levels in self._level_replays and not self._should_skip_replay(successful_levels):
             self._replay_queue = list(
                 self._level_replays[successful_levels]
             )
@@ -1026,6 +1080,49 @@ class ReactBufferAgent(LLM, Agent):
         """Return the replays file path for the current game."""
         return self._checkpoint_dir() / f"{self.game_id}.replays.json"
 
+    def _generate_video(self, label: Any) -> None:
+        """Generate an MP4 video from the current recording (background).
+
+        Args:
+            label: Suffix for the output filename (e.g. 1 -> .L1.mp4,
+                   "L0_step10" -> .L0_step10.mp4).
+        """
+        if not hasattr(self, "recorder"):
+            return
+        recording_path = self.recorder.filename
+        if not recording_path or not Path(recording_path).exists():
+            return
+
+        # Output: recordings/<game_id>.<model>.<start_time>.<label>.mp4
+        rec_dir = Path(recording_path).parent
+        model_tag = self._model.replace("/", "-").replace(":", "-")
+        time_tag = getattr(self, "_start_time_tag", "0000_0000")
+        out_name = f"{self.game_id}.{model_tag}.{time_tag}.{label}.mp4"
+        out_path = rec_dir / out_name
+
+        script = Path(__file__).resolve().parent.parent.parent / "scripts" / "visualize_recording.py"
+        if not script.exists():
+            logger.warning("Video script not found: %s", script)
+            return
+
+        cmd = [
+            sys.executable, str(script),
+            str(recording_path),
+            "-o", str(out_path),
+            "--format", "mp4",
+            "--fps", "3",
+        ]
+        try:
+            # Run in background so it doesn't block gameplay
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info("Video generation started: %s", out_name)
+        except Exception as e:
+            logger.warning("Failed to start video generation: %s", e)
+
     def _save_level_replay(self, level_num: int, actions: list[str]) -> None:
         """Persist a successful level's action sequence for future replay."""
         try:
@@ -1057,6 +1154,16 @@ class ReactBufferAgent(LLM, Agent):
         except Exception as e:
             logger.warning("Failed to load level replays: %s", e)
             return {}
+
+    def _should_skip_replay(self, level: int) -> bool:
+        """Check if replay should be skipped for this game + level."""
+        if level in self._skip_replay_global:
+            return True
+        # Check per-game rules: match if game_id starts with the configured prefix
+        for game_prefix, levels in self._skip_replay_game.items():
+            if self.game_id.startswith(game_prefix) and level in levels:
+                return True
+        return False
 
     # --------------------------------------------------------------------- #
     # Skills & system prompt (only grid_perception + arc_game_playing)
@@ -1098,6 +1205,18 @@ class ReactBufferAgent(LLM, Agent):
         self._skill_path = p / "arc_game_playing" / "SKILL.md"
         return self._skill_path
 
+    def _reset_skill_from_template(self) -> None:
+        """Copy skill template to active skills dir, resetting agent knowledge."""
+        template = Path(__file__).resolve().parent / "skills" / "arc_game_playing" / "SKILL.md"
+        if not template.exists():
+            logger.warning("Skill template not found at %s", template)
+            return
+        dest = self._get_skill_path()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        import shutil
+        shutil.copy2(template, dest)
+        logger.info("Skill reset from template: %s -> %s", template, dest)
+
     # --------------------------------------------------------------------- #
     # Tool definitions
     # --------------------------------------------------------------------- #
@@ -1106,13 +1225,67 @@ class ReactBufferAgent(LLM, Agent):
         """Game actions + update_game_notes tool."""
         functions = super().build_functions()
         functions.append({
+            "name": "execute_plan",
+            "description": (
+                "Execute a sequence of game actions efficiently WITHOUT pausing "
+                "for observation between each step. Use this for navigation when "
+                "you have a clear path (e.g., 'go DOWN 3 times then LEFT 2 times'). "
+                "Execution stops early if: (1) an action has no effect (wall hit), "
+                "(2) score changes (trigger collected / level complete), or "
+                "(3) game state changes. You will receive observation of the "
+                "final state after execution. This saves time and energy — "
+                "ALWAYS prefer this over single actions when navigating."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "actions": {
+                        "type": "string",
+                        "description": (
+                            "Comma-separated list of actions to execute in order. "
+                            "E.g., 'ACTION2,ACTION2,ACTION2,ACTION3,ACTION3'. "
+                            "Valid: ACTION1-ACTION6, RESET. Max 15 actions."
+                        ),
+                    },
+                },
+                "required": ["actions"],
+                "additionalProperties": False,
+            },
+        })
+        functions.append({
+            "name": "navigate_to",
+            "description": (
+                "Navigate to a grid position using BFS pathfinding. "
+                "The system will compute the shortest path avoiding known walls "
+                "and execute it automatically. Use this instead of manual "
+                "navigation when you know where you want to go. "
+                "The path will stop early on wall hit or score change."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "row": {
+                        "type": "integer",
+                        "description": "Target row position on the grid.",
+                    },
+                    "col": {
+                        "type": "integer",
+                        "description": "Target column position on the grid.",
+                    },
+                },
+                "required": ["row", "col"],
+                "additionalProperties": False,
+            },
+        })
+        functions.append({
             "name": "update_game_notes",
             "description": (
                 "Record discovered game knowledge to your persistent skill file. "
                 "Use this to save confirmed action mappings, game rules, level "
                 "strategies, object roles, or tips. This knowledge persists across "
                 "retries and appears in your system prompt for future decisions. "
-                "Call this BEFORE your game action when you have new discoveries."
+                "You can call this TOGETHER with a game action in the same turn — "
+                "no need to call it separately. Only record concise confirmed facts."
             ),
             "parameters": {
                 "type": "object",
@@ -1163,6 +1336,37 @@ class ReactBufferAgent(LLM, Agent):
 
         prev_frame = frames[-2] if len(frames) > 1 else frames[-1]
 
+        # --- Resolve deferred navigator update from PREVIOUS action ---
+        if self._pending_nav_update is not None:
+            old_pos, old_action = self._pending_nav_update
+            self._pending_nav_update = None
+
+            # Detect actual player movement using player-colored cells
+            player_colors = getattr(self.perception, "_player_color_votes", {})
+            confirmed_colors = {c for c, v in player_colors.items() if v >= 1}
+            prev_grid = prev_frame.frame[0] if prev_frame.frame else None
+            curr_grid = latest_frame.frame[0] if latest_frame.frame else None
+
+            if prev_grid is not None and curr_grid is not None and confirmed_colors:
+                moved = _did_player_move(prev_grid, curr_grid, confirmed_colors)
+            else:
+                nav_diff = compute_frame_diff(prev_frame, latest_frame)
+                nav_cells = _parse_cells_changed(nav_diff)
+                moved = nav_cells > MIN_CELLS_FOR_MOVEMENT
+
+            # Get current player position directly from grid
+            new_pos = self._detect_player_from_grid()
+
+            if not moved:
+                self._navigator.update_from_action_result(
+                    old_pos, old_action, moved=False, new_player_pos=None,
+                )
+            else:
+                self._navigator.update_from_action_result(
+                    old_pos, old_action, moved=True,
+                    new_player_pos=new_pos,
+                )
+
         # --- Phase 0: Level replay (skip LLM calls entirely) ---
         if self._replay_queue and self._replay_index < len(self._replay_queue):
             action_name = self._replay_queue[self._replay_index]
@@ -1179,6 +1383,7 @@ class ReactBufferAgent(LLM, Agent):
                 action_name,
                 latest_frame.levels_completed,
             )
+            self._pending_nav_update = (self._get_player_position() or (0, 0), action.name)
             return action
 
         # Replay queue exhausted — clear it and switch to LLM mode
@@ -1191,6 +1396,68 @@ class ReactBufferAgent(LLM, Agent):
             self._replay_index = 0
             # Start LLM mode with fresh conversation
             self.messages = []
+
+        # --- Phase 0b: Execute planned actions (from execute_plan tool) ---
+        if self._action_plan:
+            # Check if previous plan step hit a wall.
+            # Use player-specific movement detection to avoid false positives
+            # from grid transformations (color flashes etc.).
+            should_interrupt = False
+            interrupt_reason = ""
+
+            player_colors = getattr(self.perception, "_player_color_votes", {})
+            confirmed_colors = {
+                c for c, v in player_colors.items() if v >= 1
+            }
+            prev_grid = prev_frame.frame[0] if prev_frame.frame else None
+            curr_grid = latest_frame.frame[0] if latest_frame.frame else None
+
+            if prev_grid is not None and curr_grid is not None and confirmed_colors:
+                # Primary check: did the player actually move?
+                moved = _did_player_move(prev_grid, curr_grid, confirmed_colors)
+                if not moved:
+                    should_interrupt = True
+                    interrupt_reason = "Player did not move (wall hit)"
+            else:
+                # Fallback: use cell count when player colors unknown
+                plan_diff = compute_frame_diff(prev_frame, latest_frame)
+                plan_cells = _parse_cells_changed(plan_diff)
+                if plan_cells <= MIN_CELLS_FOR_MOVEMENT:
+                    should_interrupt = True
+                    interrupt_reason = (
+                        f"Previous action had no effect (only {plan_cells} cells changed — wall hit)"
+                    )
+
+            if not should_interrupt:
+                # Check for score change (level transition etc.)
+                prev_score = getattr(prev_frame, "score", prev_frame.levels_completed)
+                curr_score = getattr(latest_frame, "score", latest_frame.levels_completed)
+                if curr_score != prev_score:
+                    should_interrupt = True
+                    interrupt_reason = f"Score changed {prev_score}→{curr_score}!"
+
+            if should_interrupt:
+                skipped = len(self._action_plan)
+                self._action_plan = []
+                logger.info(
+                    "Plan interrupted (%s), %d actions skipped",
+                    interrupt_reason, skipped,
+                )
+                # Fall through to normal LLM mode
+            else:
+                action_name = self._action_plan.pop(0)
+                action = GameAction.from_name(action_name)
+                self._record_step(action, prev_frame, latest_frame)
+                self._last_action_name = action.name
+                logger.info(
+                    "PLAN step: %s (%d remaining)",
+                    action_name, len(self._action_plan),
+                )
+                # Get current player position directly from grid
+                pos = self._get_player_position()
+                if pos:
+                    self._pending_nav_update = (pos, action.name)
+                return action
 
         api_key = os.environ.get("OPENAI_API_KEY", "")
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip() or None
@@ -1244,8 +1511,19 @@ class ReactBufferAgent(LLM, Agent):
                     }
                     if self.REASONING_EFFORT is not None:
                         create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
+                    self._record_llm_event(
+                        "observation_request",
+                        messages=[
+                            self._serialize_message(m)
+                            for m in self._messages_for_api()
+                        ],
+                    )
                     response = client.chat.completions.create(**create_kwargs)
                     obs_content = response.choices[0].message.content or ""
+                    self._record_llm_event(
+                        "observation_response",
+                        content=obs_content,
+                    )
                     self.track_tokens(response.usage.total_tokens, obs_content)
                     break
                 except openai.APITimeoutError:
@@ -1282,8 +1560,21 @@ class ReactBufferAgent(LLM, Agent):
                 )
 
         # --- Phase 4: Action selection with tool loop ---
+        self._step_count_for_vlm += 1
         user_prompt = self.build_user_prompt(latest_frame)
-        self.push_message({"role": "user", "content": user_prompt})
+        include_image = self._should_include_image() and self._current_bbox_image is not None
+        if include_image:
+            # Multimodal message: image + text in a single user turn
+            data_url = ObjectAnnotator._encode_image(self._current_bbox_image)
+            self.push_message({
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_url, "detail": "auto"}},
+                    {"type": "text", "text": user_prompt},
+                ],
+            })
+        else:
+            self.push_message({"role": "user", "content": user_prompt})
 
         name = GameAction.ACTION5.name  # fallback
         arguments = None
@@ -1294,17 +1585,35 @@ class ReactBufferAgent(LLM, Agent):
             message = None
             for attempt in range(1, self.API_RETRIES + 1):
                 try:
+                    # Some providers (e.g. SiliconFlow/Qwen) don't support
+                    # tool_choice="required"; fall back to "auto" for them.
+                    _tc = (
+                        "auto" if "qwen" in self._model.lower()
+                        else "required"
+                    )
                     create_kwargs = {
                         "model": self._model,
                         "messages": self._messages_for_api(),
                         "tools": tools,
-                        "tool_choice": "required",
+                        "tool_choice": _tc,
                     }
                     if self.REASONING_EFFORT is not None:
                         create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
+                    self._record_llm_event(
+                        "action_request",
+                        messages=[
+                            self._serialize_message(m)
+                            for m in self._messages_for_api()
+                        ],
+                        tools=[t["function"]["name"] for t in tools],
+                    )
                     response = client.chat.completions.create(**create_kwargs)
                     self.track_tokens(response.usage.total_tokens)
                     message = response.choices[0].message
+                    self._record_llm_event(
+                        "action_response",
+                        message=self._serialize_message(message),
+                    )
                     break
                 except openai.APITimeoutError:
                     logger.warning(
@@ -1321,58 +1630,180 @@ class ReactBufferAgent(LLM, Agent):
                 break
 
             if not message.tool_calls:
-                # Model didn't call any tool — use fallback
+                # Some models (Qwen, GLM) embed tool calls in text instead
+                # of using the tool_calls field.  Try to extract one.
+                _extracted = self._extract_tool_call_from_text(
+                    message.content or ""
+                )
+                if _extracted:
+                    name, arguments = _extracted
+                    self.push_message(message)
+                    logger.info(
+                        "Extracted tool call from text: %s(%s)", name, arguments
+                    )
+                    break
+                # Genuinely no tool call — use fallback
                 self.push_message(message)
                 break
 
-            tool_call = message.tool_calls[0]
-            self._latest_tool_call_id = tool_call.id
-
-            # Push the assistant message (contains tool_calls)
+            # Push the assistant message (contains all tool_calls)
             self.push_message(message)
 
-            # Error out any extra tool calls
-            for tc in message.tool_calls[1:]:
-                self.push_message({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": "Error: only one tool call at a time.",
-                })
+            # --- Process ALL tool calls from this response ---
+            # Separate notes from game actions so notes + action = 1 API call
+            game_tc = None  # the game action / navigate / execute_plan tool call
+            need_loop = False  # whether we need another API call
 
-            if tool_call.function.name == "update_game_notes":
-                if notes_calls < self.MAX_NOTES_PER_TURN:
-                    # Process game notes update, then loop for game action
-                    notes_calls += 1
-                    result = self._handle_game_notes_update(
-                        tool_call.function.arguments
-                    )
-                    self.push_message({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    })
-                    logger.info(
-                        "update_game_notes call %d/%d: %s",
-                        notes_calls, self.MAX_NOTES_PER_TURN, result,
-                    )
+            for tc in message.tool_calls:
+                if tc.function.name == "update_game_notes":
+                    if notes_calls < self.MAX_NOTES_PER_TURN:
+                        notes_calls += 1
+                        result = self._handle_game_notes_update(
+                            tc.function.arguments
+                        )
+                        self.push_message({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": result,
+                        })
+                        logger.info(
+                            "update_game_notes call %d/%d: %s",
+                            notes_calls, self.MAX_NOTES_PER_TURN, result,
+                        )
+                    else:
+                        self.push_message({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": (
+                                f"Error: max {self.MAX_NOTES_PER_TURN} "
+                                "update_game_notes calls per turn. "
+                                "Now call a game action."
+                            ),
+                        })
+                elif game_tc is None:
+                    # First non-notes tool call = the game action
+                    game_tc = tc
                 else:
-                    # Over quota — tell LLM to pick a game action instead
+                    # Extra game action — error it
                     self.push_message({
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
+                        "tool_call_id": tc.id,
+                        "content": "Error: only one game action at a time.",
+                    })
+
+            # If model only called notes (no game action), loop for another API call
+            if game_tc is None:
+                need_loop = True
+
+            if need_loop:
+                continue
+
+            # --- Process the game action tool call ---
+            self._latest_tool_call_id = game_tc.id
+
+            if game_tc.function.name == "navigate_to":
+                # Parse target position and compute BFS path
+                try:
+                    args = json.loads(game_tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+                target_r = args.get("row", 0)
+                target_c = args.get("col", 0)
+
+                # Sync action mappings from perception
+                self._navigator.update_action_mappings(
+                    self.perception._action_effects
+                )
+
+                # Get player position
+                player_pos = self._get_player_position()
+                if player_pos is None:
+                    self.push_message({
+                        "role": "tool",
+                        "tool_call_id": game_tc.id,
                         "content": (
-                            f"Error: max {self.MAX_NOTES_PER_TURN} "
-                            "update_game_notes calls per turn. "
-                            "Now call a game action."
+                            "Error: cannot determine player position. "
+                            "Use single actions to explore first."
                         ),
                     })
-                continue
+                    continue
+
+                path = self._navigator.navigate_to(
+                    target_r, target_c, player_pos[0], player_pos[1]
+                )
+                if path is None or len(path) == 0:
+                    if path is not None and len(path) == 0:
+                        msg = "Already at target position."
+                    else:
+                        msg = (
+                            f"No path found to ({target_r},{target_c}). "
+                            "Try navigating manually or to a different target."
+                        )
+                    self.push_message({
+                        "role": "tool",
+                        "tool_call_id": game_tc.id,
+                        "content": msg,
+                    })
+                    continue
+
+                # Take first action, queue rest
+                name = path[0]
+                arguments = json.dumps({})
+                self._action_plan = path[1:]
+                logger.info(
+                    "navigate_to(%d,%d): %d-step path from (%d,%d) -> %s",
+                    target_r, target_c, len(path),
+                    player_pos[0], player_pos[1],
+                    ",".join(path),
+                )
+                break
+            elif game_tc.function.name == "execute_plan":
+                # Parse and validate the action plan
+                try:
+                    args = json.loads(game_tc.function.arguments)
+                except json.JSONDecodeError:
+                    args = {}
+                actions_str = args.get("actions", "")
+                plan_actions = [
+                    a.strip() for a in actions_str.split(",") if a.strip()
+                ]
+                valid_names = {
+                    "RESET", "ACTION1", "ACTION2", "ACTION3",
+                    "ACTION4", "ACTION5", "ACTION6",
+                }
+                invalid = [a for a in plan_actions if a not in valid_names]
+                if invalid:
+                    self.push_message({
+                        "role": "tool",
+                        "tool_call_id": game_tc.id,
+                        "content": f"Error: invalid actions: {invalid}",
+                    })
+                    continue
+                if not plan_actions:
+                    self.push_message({
+                        "role": "tool",
+                        "tool_call_id": game_tc.id,
+                        "content": "Error: no actions provided.",
+                    })
+                    continue
+                # Cap at 15 actions
+                plan_actions = plan_actions[:15]
+                # Take first action now, queue the rest
+                name = plan_actions[0]
+                arguments = json.dumps({})
+                self._action_plan = plan_actions[1:]
+                logger.info(
+                    "execute_plan: %d actions queued (%s)",
+                    len(plan_actions),
+                    ",".join(plan_actions),
+                )
+                break
             else:
-                # Game action
-                name = tool_call.function.name
-                arguments = tool_call.function.arguments
+                # Single game action (ACTION1-6, RESET)
+                name = game_tc.function.name
+                arguments = game_tc.function.arguments
                 logger.debug(
-                    f"Assistant: {name} ({tool_call.id}) {arguments}"
+                    f"Assistant: {name} ({game_tc.id}) {arguments}"
                 )
                 break
 
@@ -1392,7 +1823,111 @@ class ReactBufferAgent(LLM, Agent):
         self._record_step(action, prev_frame, latest_frame)
 
         self._last_action_name = action.name
+        player_pos = self._get_player_position()
+        if player_pos:
+            self._pending_nav_update = (player_pos, action.name)
         return action
+
+    # ------------------------------------------------------------------ #
+    #  Recording helpers
+    # ------------------------------------------------------------------ #
+
+    def push_message(self, message: Any) -> list[dict[str, Any]]:
+        """Override to record tool calls and tool results to recording."""
+        result = super().push_message(message)
+        # Record tool-role messages (tool results) and assistant tool_calls
+        if hasattr(self, "recorder") and not self.is_playback:
+            msg = self._serialize_message(message)
+            role = msg.get("role") if isinstance(msg, dict) else None
+            if role == "tool":
+                self._record_llm_event(
+                    "tool_result",
+                    tool_call_id=msg.get("tool_call_id"),
+                    content=msg.get("content", "")[:500],
+                )
+            elif role == "assistant" and msg.get("tool_calls"):
+                self._record_llm_event(
+                    "tool_call",
+                    tool_calls=msg["tool_calls"],
+                )
+        return result
+
+    def _record_llm_event(self, event_type: str, **kwargs: Any) -> None:
+        """Record an LLM interaction event to the recording file.
+
+        event_type: 'observation_request', 'observation_response',
+                    'action_request', 'action_response',
+                    'tool_call', 'tool_result'
+        """
+        if not hasattr(self, "recorder") or self.is_playback:
+            return
+        data: dict[str, Any] = {"event": event_type}
+        data.update(kwargs)
+        self.recorder.record(data)
+
+    def _serialize_message(self, msg: Any) -> Any:
+        """Convert an OpenAI message object or dict to JSON-serializable form."""
+        if isinstance(msg, dict):
+            return msg
+        if hasattr(msg, "model_dump"):
+            return msg.model_dump()
+        return str(msg)
+
+    # ------------------------------------------------------------------ #
+    #  Qwen / GLM text-based tool call extraction
+    # ------------------------------------------------------------------ #
+
+    _TEXT_ACTION_RE = re.compile(
+        r"(?:ACTION[1-6]|RESET|navigate_to|execute_plan)"
+    )
+
+    def _extract_tool_call_from_text(
+        self, text: str
+    ) -> Optional[tuple[str, str]]:
+        """Try to parse a tool call embedded in plain text.
+
+        Some models (Qwen, GLM) sometimes write tool calls in their text
+        content instead of using the structured tool_calls field.
+        Handles patterns like:
+          - {"name": "ACTION1", "arguments": {}}
+          - <tool_call>ACTION1</tool_call>
+          - navigate_to(33, 21)
+
+        Returns (name, arguments_json) or None.
+        """
+        # Pattern 1: JSON object with "name" key
+        for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"([^"]+)"[^{}]*\}', text):
+            fn_name = m.group(1)
+            if self._TEXT_ACTION_RE.match(fn_name):
+                # Try to extract arguments
+                try:
+                    obj = json.loads(m.group(0))
+                    args = obj.get("arguments", {})
+                    if isinstance(args, str):
+                        return fn_name, args
+                    return fn_name, json.dumps(args)
+                except json.JSONDecodeError:
+                    return fn_name, "{}"
+
+        # Pattern 2: <tool_call>ACTION1</tool_call>
+        tc_match = re.search(r"<tool_call>\s*(\w+)\s*</tool_call>", text)
+        if tc_match:
+            fn_name = tc_match.group(1)
+            if self._TEXT_ACTION_RE.match(fn_name):
+                return fn_name, "{}"
+
+        # Pattern 3: navigate_to(row, col) in text
+        nav_match = re.search(r"navigate_to\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)", text)
+        if nav_match:
+            row, col = nav_match.group(1), nav_match.group(2)
+            return "navigate_to", json.dumps({"row": int(row), "col": int(col)})
+
+        # Pattern 4: bare ACTION name at end of text
+        bare_match = re.search(r"\b(ACTION[1-6]|RESET)\b\s*$", text.strip())
+        if bare_match:
+            return bare_match.group(1), "{}"
+
+        return None
 
     def _record_step(
         self,
@@ -1417,10 +1952,81 @@ class ReactBufferAgent(LLM, Agent):
         )
         self._current_steps.append(step)
 
-        # State-action embedding for residual scoring
-        sa_text = f"{state_text} {action.name} {diff_text}"
-        sa_emb = self._embedder.encode(sa_text)
-        self._current_step_embeddings.append(sa_emb)
+        # --- Game intelligence module updates ---
+        player_pos = self._get_player_position()
+
+        # NOTE: Navigator wall/walkable updates are handled via the deferred
+        # _pending_nav_update mechanism in choose_action (resolved at the START
+        # of the next call when the result frame is available).
+
+        # InteractionTracker: detect events
+        prev_grid = None
+        curr_grid = None
+        if hasattr(self, "frames") and len(self.frames) > 1:
+            if prev_frame.frame:
+                prev_grid = prev_frame.frame[0]
+            if latest_frame.frame:
+                curr_grid = latest_frame.frame[0]
+
+        if prev_grid is not None and curr_grid is not None:
+            events = self._interaction_tracker.track_step(
+                step_num=len(self._current_steps),
+                prev_grid=prev_grid,
+                curr_grid=curr_grid,
+                player_pos=player_pos,
+                score_before=prev_score,
+                score_after=curr_score,
+                action=action.name,
+            )
+            # Mark collected items in inventory
+            collected_any = False
+            for ev in events:
+                if (
+                    ev.event_type.value == "COLLECTED"
+                    and ev.object_color is not None
+                    and ev.position is not None
+                ):
+                    self._inventory.mark_collected(ev.object_color, ev.position)
+                    collected_any = True
+
+                    # Invalidate confirmed walls near the collected trigger —
+                    # grid layout may have changed (doors opened, walls removed).
+                    qr = (ev.position[0] // 5) * 5
+                    qc = (ev.position[1] // 5) * 5
+                    removed = self._navigator.memory.invalidate_near(
+                        (qr, qc), radius=3
+                    )
+                    if removed > 0:
+                        logger.info(
+                            "Invalidated %d wall edges near collected "
+                            "trigger at (%d,%d)",
+                            removed, qr, qc,
+                        )
+
+            # Trigger collection changed the grid — refresh walkability
+            # and interrupt any running plan (path is stale).
+            if collected_any and curr_grid is not None:
+                analysis = self.perception.analyze_grid(curr_grid)
+                self._navigator.refresh_walkability(
+                    curr_grid, analysis.bg_color
+                )
+                if self._action_plan:
+                    skipped = len(self._action_plan)
+                    self._action_plan = []
+                    logger.info(
+                        "Plan interrupted: trigger collected, "
+                        "grid changed — %d actions skipped",
+                        skipped,
+                    )
+
+            # Transformation detection (rotation, mirror, color map, shift)
+            self._transformation_detector.analyze_step(
+                step_num=len(self._current_steps),
+                prev_grid=prev_grid,
+                curr_grid=curr_grid,
+                player_pos=player_pos,
+                action=action.name,
+            )
 
         # Loop detection
         self._loop_detection = self._loop_detector.analyze(self._current_steps)
@@ -1438,7 +2044,8 @@ class ReactBufferAgent(LLM, Agent):
                 ld.steps_since_score_change,
             )
 
-        # Attach reasoning metadata
+        # Attach reasoning metadata + LLM reasoning log
+        reasoning_log = self._last_response_content or ""
         action.reasoning = {
             "model": self._model,
             "agent_type": "react_buffer",
@@ -1450,6 +2057,7 @@ class ReactBufferAgent(LLM, Agent):
             "step_in_episode": len(self._current_steps),
             "reasoning_tokens": self._last_reasoning_tokens,
             "total_reasoning_tokens": self._total_reasoning_tokens,
+            "reasoning_log": reasoning_log[:2000],
             "loop_detection": {
                 "is_looping": ld.is_looping,
                 "cycle_actions": ld.cycle_actions,
@@ -1471,6 +2079,259 @@ class ReactBufferAgent(LLM, Agent):
             and len(self._current_steps) % self.CHECKPOINT_INTERVAL == 0
         ):
             self._save_checkpoint()
+
+        # Periodic video snapshot every 10 total actions (overwrites previous)
+        total_actions = self.action_counter if hasattr(self, "action_counter") else 0
+        if total_actions > 0 and total_actions % 10 == 0:
+            self._generate_video("progress")
+
+    # --------------------------------------------------------------------- #
+    # Player position helper
+    # --------------------------------------------------------------------- #
+
+    def _should_include_image(self) -> bool:
+        """Decide whether to embed bbox image in the current step's message.
+
+        Modes:
+          - "always": every step
+          - "periodic": first INLINE_VLM_WARMUP steps, then every INLINE_VLM_INTERVAL steps
+          - "off": never
+        """
+        if self.INLINE_VLM == "always":
+            return True
+        if self.INLINE_VLM == "off":
+            return False
+        # periodic mode
+        step = self._step_count_for_vlm
+        if step < self.INLINE_VLM_WARMUP:
+            return True
+        return (step - self.INLINE_VLM_WARMUP) % self.INLINE_VLM_INTERVAL == 0
+
+    def _get_player_position(self) -> Optional[tuple[int, int]]:
+        """Extract current player position.
+
+        During/after plan execution, compute position directly from the
+        latest grid frame using known player colors (avoids stale
+        perception._player_obj).
+
+        Returns (row, col) or None if player not yet identified.
+        """
+        # Try direct grid detection first (works during plans)
+        pos = self._detect_player_from_grid()
+        if pos is not None:
+            self._last_detected_pos = pos
+            return pos
+
+        # Fallback to perception
+        player = self.perception._player_obj
+        if player is not None:
+            pos = (int(player.center_r), int(player.center_c))
+            self._last_detected_pos = pos
+            return pos
+        return None
+
+    # Rows reserved for UI at the bottom (energy bar, score display)
+    _UI_BOTTOM_ROW = 52
+
+    def _detect_player_from_grid(self) -> Optional[tuple[int, int]]:
+        """Find player position directly from the latest frame grid.
+
+        Uses confirmed player colors, excludes UI rows.  Instead of
+        flood-fill clustering (which breaks when the player overlaps
+        game patterns), uses a density-based search around the expected
+        player area.
+
+        Strategy:
+        1. If we have a last-known position, search in a window around it.
+        2. Otherwise, find the densest 10x10 window of player-colored cells
+           in the playable area.
+        """
+        if not self.frames:
+            return None
+        latest = self.frames[-1]
+        if not latest.frame:
+            return None
+        grid = latest.frame[0]
+
+        player_votes = getattr(self.perception, "_player_color_votes", {})
+        colors = {c for c, v in player_votes.items() if v >= 1}
+        if not colors:
+            return None
+
+        H = min(len(grid), self._UI_BOTTOM_ROW)
+        W = len(grid[0]) if len(grid) > 0 else 0
+
+        # Get last known position as anchor (prefer most recent detection)
+        anchor: Optional[tuple[int, int]] = getattr(
+            self, "_last_detected_pos", None
+        )
+        if anchor is None:
+            player_obj = self.perception._player_obj
+            if player_obj is not None:
+                anchor = (int(player_obj.center_r), int(player_obj.center_c))
+
+        # If we have an anchor, search a 20x20 window around it
+        if anchor is not None:
+            ar, ac = anchor
+            r_min = max(0, ar - 10)
+            r_max = min(H, ar + 10)
+            c_min = max(0, ac - 10)
+            c_max = min(W, ac + 10)
+            r_sum, c_sum, count = 0.0, 0.0, 0
+            for r in range(r_min, r_max):
+                for c in range(c_min, c_max):
+                    if grid[r][c] in colors:
+                        r_sum += r
+                        c_sum += c
+                        count += 1
+            if count >= 5:
+                return (int(r_sum / count), int(c_sum / count))
+
+        # No anchor or anchor search failed: sliding window approach
+        # Find the 10x10 window with the most player-colored cells
+        best_count = 0
+        best_r, best_c = 0, 0
+        step = 5  # slide by STEP_SIZE for efficiency
+        for wr in range(0, H - 10, step):
+            for wc in range(0, W - 10, step):
+                count = 0
+                for r in range(wr, min(wr + 10, H)):
+                    for c in range(wc, min(wc + 10, W)):
+                        if grid[r][c] in colors:
+                            count += 1
+                if count > best_count:
+                    best_count = count
+                    best_r, best_c = wr, wc
+
+        if best_count < 5:
+            return None
+
+        # Compute centroid within the best window
+        r_sum, c_sum, total = 0.0, 0.0, 0
+        for r in range(best_r, min(best_r + 10, H)):
+            for c in range(best_c, min(best_c + 10, W)):
+                if grid[r][c] in colors:
+                    r_sum += r
+                    c_sum += c
+                    total += 1
+        return (int(r_sum / total), int(c_sum / total))
+
+    # --------------------------------------------------------------------- #
+    # Level completion auto-summary
+    # --------------------------------------------------------------------- #
+
+    def _generate_level_summary(self, level_num: int) -> None:
+        """Auto-generate a clean level summary and write it to SKILL.md.
+
+        Called from _prepare_next_level() BEFORE modules are reset, so all
+        accumulated knowledge (interaction rules, inventory classifications,
+        events) is still available.
+        """
+        parts: list[str] = [f"## Level {level_num} Summary (auto-generated)"]
+
+        # 1. Action mappings (from perception)
+        effects = getattr(self.perception, "_action_effects", {})
+        if effects:
+            mapping_lines = []
+            for action, direction in sorted(effects.items()):
+                mapping_lines.append(f"- {action} = {direction}")
+            parts.append("Action mappings: " + ", ".join(
+                f"{a}={d}" for a, d in sorted(effects.items())
+            ))
+
+        # 2. Interaction rules (what objects do)
+        rules = self._interaction_tracker.get_rules()
+        if rules:
+            parts.append("Interaction rules:")
+            for rule in sorted(rules.values(), key=lambda r: r.confidence, reverse=True):
+                parts.append(f"  {rule.describe()}")
+
+        # 3. Key events — focus on SCORED and what happened right before
+        scored_events = [
+            e for e in self._interaction_tracker._events
+            if e.event_type == InteractionEventType.SCORED
+        ]
+        collected_events = [
+            e for e in self._interaction_tracker._events
+            if e.event_type == InteractionEventType.COLLECTED
+        ]
+        if scored_events:
+            se = scored_events[-1]  # last score event = level completion trigger
+            parts.append(f"Level completion trigger: {se.description} at step {se.step}")
+            # What was collected right before scoring?
+            pre_score_collected = [
+                e for e in collected_events if e.step <= se.step
+            ]
+            if pre_score_collected:
+                colors_collected = set(e.object_color for e in pre_score_collected if e.object_color is not None)
+                parts.append(f"Objects collected before scoring: colors {sorted(colors_collected)}")
+                for e in pre_score_collected[-3:]:  # last 3
+                    parts.append(f"  Step {e.step}: {e.description}")
+
+        # 4. Object role classifications (from inventory)
+        inv = self._inventory
+        role_parts = []
+        if inv._player_colors:
+            role_parts.append(f"Player colors: {sorted(inv._player_colors)}")
+        if inv._floor_colors:
+            role_parts.append(f"Floor colors: {sorted(inv._floor_colors)}")
+        if inv._wall_colors:
+            role_parts.append(f"Wall colors: {sorted(inv._wall_colors)}")
+        if inv._collected_colors:
+            role_parts.append(f"Collectible colors: {sorted(inv._collected_colors)}")
+        if role_parts:
+            parts.append("Object classifications: " + "; ".join(role_parts))
+
+        # 5. Toggle positions (if any)
+        toggles = self._interaction_tracker._toggle_positions
+        if toggles:
+            parts.append(f"Toggle positions detected: {len(toggles)} — avoid revisiting!")
+
+        # 5b. Grid transformations detected during this level
+        if self._transformation_detector._history:
+            parts.append("Grid transformations observed:")
+            seen_types: set[str] = set()
+            for tev in self._transformation_detector._history:
+                ttype = tev.transform_type.value
+                if ttype not in seen_types:
+                    seen_types.add(ttype)
+                    parts.append(f"  {tev.description}")
+            if self._transformation_detector._learned_rules:
+                parts.append("  Learned transform triggers:")
+                for (act, pos), types in self._transformation_detector._learned_rules.items():
+                    unique = sorted(set(t.value for t in types))
+                    parts.append(f"    {act} near {pos} -> {', '.join(unique)}")
+
+        # 6. Step count and efficiency
+        total_steps = len(self._current_steps)
+        parts.append(f"Completed in {total_steps} steps")
+
+        # 7. Strategy recommendation for next level
+        parts.append("")
+        parts.append(f"## Strategy for Level {level_num + 1}")
+        if collected_events and scored_events:
+            parts.append("- Collect prerequisite objects FIRST, then navigate to exit/goal")
+            colors_needed = set(e.object_color for e in collected_events if e.object_color is not None)
+            if colors_needed:
+                parts.append(f"- Look for objects of colors {sorted(colors_needed)} — they were prerequisites in Level {level_num}")
+        elif scored_events and not collected_events:
+            parts.append("- Navigate directly to exit/goal (no prerequisites needed)")
+        parts.append("- Scan OBJECT INVENTORY for exit structures and prerequisite objects")
+        parts.append("- Same game mechanics apply — reuse learned interaction rules")
+
+        summary_text = "\n".join(parts)
+
+        # Write to SKILL.md — replace level_strategies section with clean summary
+        notes_json = json.dumps({
+            "section": "level_strategies",
+            "content": summary_text,
+            "replace": "true",
+        })
+        result = self._handle_game_notes_update(notes_json)
+        logger.info(
+            "Auto-generated Level %d summary (%d chars): %s",
+            level_num, len(summary_text), result,
+        )
 
     # --------------------------------------------------------------------- #
     # update_game_notes tool handler
@@ -1574,7 +2435,7 @@ class ReactBufferAgent(LLM, Agent):
     # --------------------------------------------------------------------- #
 
     def build_func_resp_prompt(self, latest_frame: FrameData) -> str:
-        """Observation prompt: perception data + buffer context + residual hints.
+        """Observation prompt: perception data + buffer context.
 
         Strategy is handled by the skills in the system prompt.
         This prompt provides the DATA the LLM needs to make decisions.
@@ -1607,21 +2468,89 @@ class ReactBufferAgent(LLM, Agent):
             )
             sections.append(perception_text)
 
-            # VLM: entity identification + change interpretation
-            vlm_sections = self._get_vlm_analysis(
-                latest_frame, prev_frame_grids
+            # Store bbox image for inline VLM mode (used in Phase 4 multimodal message)
+            grid = latest_frame.frame[0]
+            analysis = self.perception.analyze_grid(grid)
+            bbox_img = self.perception.render_grid(grid, analysis=analysis)
+            if bbox_img is not None:
+                self._current_bbox_image = bbox_img
+
+            if self.INLINE_VLM != "off":
+                # Skip separate VLM calls — LLM sees image inline (always or periodic)
+                pass
+            else:
+                # VLM: entity identification + change interpretation
+                vlm_sections = self._get_vlm_analysis(
+                    latest_frame, prev_frame_grids
+                )
+                sections.extend(vlm_sections)
+
+            # --- Game intelligence module updates for prompt ---
+            # (grid and analysis already computed above for bbox rendering)
+            # Sync plan-estimated position now that perception has run
+            player_pos = self._get_player_position()
+
+            # Update navigator with action mappings and grid analysis
+            self._navigator.update_action_mappings(
+                self.perception._action_effects
             )
-            sections.extend(vlm_sections)
+            if not self._navigator._initialized:
+                self._navigator.infer_floor_and_walls(grid, analysis.bg_color)
+            else:
+                # Re-infer walkability every observation to catch grid
+                # changes from trigger collection, level transitions, etc.
+                self._navigator.refresh_walkability(grid, analysis.bg_color)
+
+            # Record current player position as walkable (perception is properly updated here)
+            if player_pos:
+                qr = (player_pos[0] // 5) * 5
+                qc = (player_pos[1] // 5) * 5
+                self._navigator.memory.record_walkable((qr, qc))
+
+            # Update inventory with current objects
+            player_colors = set()
+            if self.perception._player_obj is not None:
+                player_colors.add(self.perception._player_obj.color)
+            for c, count in self.perception._player_color_votes.items():
+                if count >= 1:
+                    player_colors.add(c)
+
+            self._inventory.update_from_analysis(
+                objects=analysis.objects,
+                bg_color=analysis.bg_color,
+                player_pos=player_pos,
+                player_colors=player_colors,
+                step=len(self._current_steps),
+                interaction_rules=self._interaction_tracker.get_rules(),
+            )
+            self._inventory.update_distances(player_pos, self._navigator)
+
+        # Game intelligence prompt sections
+        rules_summary = self._interaction_tracker.get_rules_summary()
+        if rules_summary:
+            sections.append(rules_summary)
+        toggle_warnings = self._interaction_tracker.get_toggle_warnings()
+        if toggle_warnings:
+            sections.append(toggle_warnings)
+        recent_events = self._interaction_tracker.get_recent_events(3)
+        if recent_events:
+            sections.append(recent_events)
+        transform_summary = self._transformation_detector.get_summary()
+        if transform_summary:
+            sections.append(transform_summary)
+
+        inventory_summary = self._inventory.get_inventory_summary()
+        if inventory_summary:
+            sections.append(inventory_summary)
+
+        navigator_status = self._navigator.get_status_summary()
+        if navigator_status:
+            sections.append(navigator_status)
 
         # Past attempts from buffer
         buffer_ctx = self._build_buffer_context()
         if buffer_ctx:
             sections.append(buffer_ctx)
-
-        # Residual action hints
-        residual_hint = self._build_residual_hint(latest_frame)
-        if residual_hint:
-            sections.append(residual_hint)
 
         # Anti-repetition: action history, loop warning, stuck warning
         action_history = self._build_action_history()
@@ -1636,28 +2565,61 @@ class ReactBufferAgent(LLM, Agent):
         if stuck_warning:
             sections.append(stuck_warning)
 
+        # Level transition hint — encourage applying cross-level learning
+        levels_done = getattr(latest_frame, "levels_completed", 0)
+        if levels_done > 0 and len(self._current_steps) < 5:
+            sections.append(
+                "# LEVEL TRANSITION\n"
+                f"You just entered level {levels_done + 1}. "
+                "The game mechanics from previous levels likely still apply.\n"
+                "1. Check your game_notes for rules you discovered in previous levels\n"
+                "2. Scan the grid for the SAME types of interactive objects\n"
+                "3. Apply the same prerequisite/collection strategy that worked before\n"
+                "4. Use navigate_to(row, col) for efficient pathfinding to targets\n"
+                "5. Use update_game_notes to record any new discoveries"
+            )
+
         # Instruction
         sections.append(
             "# YOUR TURN\n"
             "Follow the arc_game_playing skill reasoning template.\n"
             "If you confirmed new knowledge, call update_game_notes first.\n"
-            "Then call exactly one game action."
+            "Then call navigate_to(row, col) to reach a target from OBJECT INVENTORY,\n"
+            "or a single ACTION for exploration. Do NOT write navigate_to in text — "
+            "you MUST call it as a tool/function call."
         )
 
         return "\n\n".join(sections)
 
     def build_user_prompt(self, latest_frame: FrameData) -> str:
         """Minimal user prompt — strategy is in the skills system prompt."""
-        return textwrap.dedent("""\
+        base = textwrap.dedent("""\
             You are playing an unknown ARC-AGI-3 grid game.
             Follow your grid_perception and arc_game_playing skills.
 
-            Available tools:
-            - update_game_notes: Save discovered knowledge (call BEFORE game action)
-            - RESET, ACTION1-ACTION6: Game control
+            ## Tool priority (IMPORTANT — use the FIRST applicable tool):
+            1. **navigate_to(row, col)** — ALWAYS use this to reach any target in OBJECT INVENTORY.
+               It auto-computes BFS shortest path avoiding walls. Call it as a function/tool call.
+               Example: to go to color 1 at (33,21), call the navigate_to tool with row=33, col=21.
+            2. execute_plan("ACTION2,ACTION3,...") — only when you know an exact short sequence.
+            3. Single ACTION1-ACTION6 — only for the first 3 steps to learn direction mappings.
+            4. update_game_notes — save confirmed knowledge (call together with a game action).
 
-            You may call update_game_notes to record discoveries, then call exactly one game action.
+            RULE: After direction mappings are learned, ALWAYS use navigate_to to reach targets.
+            Never manually chain single actions to reach a known position — navigate_to does it better.
         """)
+        if self._should_include_image() and self._current_bbox_image is not None:
+            base += textwrap.dedent("""\
+
+                The image above shows the current game grid with bounding boxes around detected objects.
+                A white UP arrow in the top-right indicates orientation.
+
+                Before choosing an action:
+                1. Identify key entities in the image (player, walls, collectibles, doors, etc.)
+                2. If you took an action last turn, assess its effect (did you move? hit a wall? collect something?)
+                3. Then choose your next action using a tool call.
+            """)
+        return base
 
     # --------------------------------------------------------------------- #
     # VLM & buffer helpers
@@ -1815,47 +2777,6 @@ class ReactBufferAgent(LLM, Agent):
 
         return "\n".join(lines)
 
-    def _build_residual_hint(self, latest_frame: FrameData) -> str:
-        """Compute per-action residual scores and format as LLM hint."""
-        if self.episode_buffer.get_size() == 0:
-            return ""
-
-        state_text = encode_frame_compact(latest_frame)
-        query_emb = self._embedder.encode(state_text)
-
-        action_names = [
-            "ACTION1",
-            "ACTION2",
-            "ACTION3",
-            "ACTION4",
-            "ACTION5",
-            "ACTION6",
-        ]
-        scores: dict[str, float] = {}
-
-        for name in action_names:
-            sa_emb = self._embedder.encode(f"{state_text} {name}")
-            scores[name] = self.residual_fn.score_action(
-                sa_emb, self.episode_buffer, query_emb, k=self.NUM_RETRIEVE
-            )
-
-        if all(abs(s) < 1e-6 for s in scores.values()):
-            return ""
-
-        sorted_actions = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-
-        lines: list[str] = [
-            "\n# Residual Guidance (from past experience)",
-            "Scores: positive = similar to past success, "
-            "negative = similar to past failure:",
-        ]
-        for name, score in sorted_actions:
-            if abs(score) >= 1e-6:
-                sign = "+" if score > 0 else ""
-                lines.append(f"  {name}: {sign}{score:.3f}")
-
-        return "\n".join(lines)
-
     def _build_action_history(self) -> str:
         """Last ~15 actions with [NO EFFECT] / [SCORE+] markers.
 
@@ -1924,7 +2845,7 @@ class ReactBufferAgent(LLM, Agent):
 
         lines: list[str] = [
             f"# STUCK: Score unchanged for {ld.steps_since_score_change} steps",
-            "Your current strategy is not working. You need to change approach.",
+            "Your current strategy is not working. You MUST change approach:",
         ]
 
         if ld.no_effect_actions:
@@ -1943,6 +2864,37 @@ class ReactBufferAgent(LLM, Agent):
                 "AVOID these actions and try ones you haven't used recently."
             )
 
+        # Suggest exploration when all inventory items are visited
+        all_visited = (
+            self._inventory._items
+            and all(
+                item.status
+                in (ObjectStatus.VISITED, ObjectStatus.COLLECTED)
+                for item in self._inventory._items
+            )
+        )
+        if all_visited:
+            lines.append(
+                "All known objects were NOT interactive. "
+                "Navigate to a completely different area of the grid "
+                "(e.g., opposite corner) to discover new objects."
+            )
+
+        # Suggest exploration targets based on grid coverage
+        player_pos = self._get_player_position()
+        if player_pos and ld.steps_since_score_change >= 12:
+            pr, pc = player_pos
+            suggestions = []
+            if pr > 30:
+                suggestions.append("navigate_to(10, 30)")
+            else:
+                suggestions.append("navigate_to(50, 30)")
+            if pc > 30:
+                suggestions.append(f"navigate_to({pr}, 10)")
+            else:
+                suggestions.append(f"navigate_to({pr}, 50)")
+            lines.append(f"Try exploring: {' or '.join(suggestions)}")
+
         return "\n".join(lines)
 
     # --------------------------------------------------------------------- #
@@ -1951,9 +2903,17 @@ class ReactBufferAgent(LLM, Agent):
 
     @property
     def name(self) -> str:
-        obs = "with-observe" if self.DO_OBSERVATION else "no-observe"
+        if self.INLINE_VLM == "always":
+            obs = "inline-vlm"
+        elif self.INLINE_VLM == "periodic":
+            obs = "periodic-vlm"
+        elif self.DO_OBSERVATION:
+            obs = "with-observe"
+        else:
+            obs = "no-observe"
         model = self._model.replace("/", "-").replace(":", "-")
+        ts = getattr(self, "_start_time_tag", "0000_0000")
         return (
             f"{self.game_id}.reactbuffer.{model}.{obs}"
-            f".retry{self.MAX_RETRIES}"
+            f".retry{self.MAX_RETRIES}.{ts}"
         )

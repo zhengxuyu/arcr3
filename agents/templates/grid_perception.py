@@ -556,15 +556,40 @@ class GridPerception:
         smallest = min(movements, key=lambda m: m.size)
 
         # Find matching objects in the current analysis
+        player_obj = None
         for obj in analysis.objects:
             dist = (
                 abs(obj.center_r - smallest.new_center[0])
                 + abs(obj.center_c - smallest.new_center[1])
             )
             if dist < 3:
+                player_obj = obj
                 self._player_obj = obj
                 self._player_color_votes[obj.color] += 1
                 break
+
+        # Also vote for nearby objects that are likely part of the same
+        # multi-color player entity (e.g. body=color9, head=color12).
+        # Only consider objects whose color also moved this step, to avoid
+        # voting for static game elements (patterns, decorations) near the
+        # player.
+        if player_obj is not None:
+            moving_colors: set[int] = set()
+            for m in movements:
+                moving_colors.update(m.colors)
+            for obj in analysis.objects:
+                if obj is player_obj:
+                    continue
+                if obj.size >= 50:
+                    continue
+                if obj.color not in moving_colors:
+                    continue
+                ndist = (
+                    abs(obj.center_r - player_obj.center_r)
+                    + abs(obj.center_c - player_obj.center_c)
+                )
+                if ndist <= 5:  # within one step
+                    self._player_color_votes[obj.color] += 1
 
     def _learn_action_effect(
         self, action: str, movements: list[MovedObject]
@@ -1161,7 +1186,7 @@ class ObjectAnnotator:
 
     def __init__(
         self,
-        model: str = "gpt-4o-mini",
+        model: Optional[str] = None,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
     ):
@@ -1173,7 +1198,7 @@ class ObjectAnnotator:
             api_key=api_key or os.environ.get("OPENAI_API_KEY", ""),
             base_url=base_url or os.environ.get("OPENAI_BASE_URL") or None,
         )
-        self._model = model
+        self._model = model or os.environ.get("VLM_MODEL", "") or "gpt-4o-mini"
 
     # ------------------------------------------------------------------ #
     #  Object identification (periodic)
